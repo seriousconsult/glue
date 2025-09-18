@@ -17,9 +17,13 @@ const (
 )
 
 // Define which columns you want to keep (0-indexed).
-var columnsToKeep = []int{0, 2, 12, 54,55,56,57,58}
+var columnsToKeep = []int{0, 2, 12, 54, 55, 56, 57, 58}
 
 func main() {
+	// Add line number and file name to log messages for better debugging.
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetOutput(os.Stdout)
+	
 	// Use all available CPU cores for parallel processing.
 	numWorkers := runtime.NumCPU()
 	fmt.Printf("Starting CSV processing with %d workers...\n", numWorkers)
@@ -76,21 +80,28 @@ func readCSV(rowsChan chan<- []string, wg *sync.WaitGroup) {
 
 	reader := csv.NewReader(inputFile)
 	// Allows rows with a variable number of fields.
-	reader.FieldsPerRecord = -1 
-	
+	reader.FieldsPerRecord = -1
+
 	lineCount := 0
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
+			log.Printf("Read loop finished. Reached end of file at line %d.", lineCount)
 			break
 		}
-		// A common error for inconsistent fields. We'll log and continue.
 		if err != nil {
+			// Log a specific error about the read failure.
 			log.Printf("Error reading row at line %d: %v. Skipping...", lineCount, err)
-			continue
+			continue // Skip the bad row and try the next one
 		}
-		rowsChan <- record
+		
+		// Log every 10,000 lines to track progress
 		lineCount++
+		if lineCount%10000 == 0 {
+			log.Printf("Successfully read %d lines...", lineCount)
+		}
+		
+		rowsChan <- record
 	}
 }
 
@@ -124,7 +135,6 @@ func writeCSV(processedRowsChan <-chan []string, wg *sync.WaitGroup) {
 
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {
-		// Changed to Printf so the program doesn't exit.
 		log.Printf("Error creating output file: %v", err)
 		return
 	}
@@ -135,10 +145,8 @@ func writeCSV(processedRowsChan <-chan []string, wg *sync.WaitGroup) {
 
 	for record := range processedRowsChan {
 		if err := writer.Write(record); err != nil {
-			// Changed to Printf so the program doesn't exit.
 			log.Printf("Error writing record to output file: %v", err)
 			continue
 		}
 	}
-}
 }
