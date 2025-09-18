@@ -75,18 +75,22 @@ func readCSV(rowsChan chan<- []string, wg *sync.WaitGroup) {
 	defer inputFile.Close()
 
 	reader := csv.NewReader(inputFile)
-	reader.FieldsPerRecord = -1 // Allow malformed rows
-
+	// Allows rows with a variable number of fields.
+	reader.FieldsPerRecord = -1 
+	
+	lineCount := 0
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
+		// A common error for inconsistent fields. We'll log and continue.
 		if err != nil {
-			log.Printf("Error reading row. This is most likely caused by a line with an inconsistent number of fields: %v. Skipping...", err)
+			log.Printf("Error reading row at line %d: %v. Skipping...", lineCount, err)
 			continue
 		}
 		rowsChan <- record
+		lineCount++
 	}
 }
 
