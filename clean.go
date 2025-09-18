@@ -17,7 +17,8 @@ const (
 )
 
 // Define which columns you want to keep (0-indexed).
-var columnsToKeep = []int{0, 2, 12, 55, 57}
+//var columnsToKeep = []int{0, 2, 12, 55, 57}
+var columnsToKeep = []int{0, 1,3,4}
 
 func main() {
 	// Add line number and file name to log messages for better debugging.
