@@ -17,7 +17,7 @@ const (
 )
 
 // Define which columns you want to keep (0-indexed).
-var columnsToKeep = []int{0, 5, 10, 150}
+var columnsToKeep = []int{0, 5, 10, 56, 54, 2, 12}
 
 func main() {
 	// Use all available CPU cores for parallel processing.
@@ -30,6 +30,10 @@ func main() {
 
 	var readerWg sync.WaitGroup
 	var writerWg sync.WaitGroup
+	
+	// Add a counter for rows to see how many are processed.
+	var processedCount int
+	var countMutex sync.Mutex
 
 	// Goroutine 1: Read the input file and send rows to the pipeline.
 	readerWg.Add(1)
@@ -38,7 +42,7 @@ func main() {
 	// Goroutines 2 to N: Worker pool to process rows concurrently.
 	readerWg.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
-		go processRows(rowsChan, processedRowsChan, &readerWg)
+		go processRows(rowsChan, processedRowsChan, &readerWg, &countMutex, &processedCount)
 	}
 
 	// Goroutine N+1: Close the processedRowsChan once all workers are done.
@@ -56,7 +60,7 @@ func main() {
 	// Wait for the entire writing process to complete.
 	writerWg.Wait()
 
-	fmt.Println("CSV processing complete.")
+	fmt.Printf("CSV processing complete. Total rows processed: %d\n", processedCount)
 }
 
 // readCSV reads the input file and sends each row to the rowsChan.
@@ -79,7 +83,7 @@ func readCSV(rowsChan chan<- []string, wg *sync.WaitGroup) {
 			break
 		}
 		if err != nil {
-			log.Printf("Error reading row: %v. Skipping...", err)
+			log.Printf("Error reading row. This is most likely caused by a line with an inconsistent number of fields: %v. Skipping...", err)
 			continue
 		}
 		rowsChan <- record
@@ -87,7 +91,7 @@ func readCSV(rowsChan chan<- []string, wg *sync.WaitGroup) {
 }
 
 // processRows reads from rowsChan, truncates the row, and sends it to processedRowsChan.
-func processRows(rowsChan <-chan []string, processedRowsChan chan<- []string, wg *sync.WaitGroup) {
+func processRows(rowsChan <-chan []string, processedRowsChan chan<- []string, wg *sync.WaitGroup, countMutex *sync.Mutex, processedCount *int) {
 	defer wg.Done()
 
 	for record := range rowsChan {
@@ -96,10 +100,17 @@ func processRows(rowsChan <-chan []string, processedRowsChan chan<- []string, wg
 			if colIndex < len(record) {
 				newRecord = append(newRecord, record[colIndex])
 			} else {
-				newRecord = append(newRecord, "")
+				// Handle malformed rows by adding a nil value
+				newRecord = append(newRecord, "NULL")
+				log.Printf("Warning: Column index %d is out of bounds for row with %d fields. Adding NULL.", colIndex, len(record))
 			}
 		}
 		processedRowsChan <- newRecord
+		
+		// Safely increment the row counter
+		countMutex.Lock()
+		*processedCount++
+		countMutex.Unlock()
 	}
 }
 
@@ -122,4 +133,3 @@ func writeCSV(processedRowsChan <-chan []string, wg *sync.WaitGroup) {
 		}
 	}
 }
-
