@@ -142,8 +142,8 @@ func main() {
 	file1Path := os.Args[1]
 	file2Path := os.Args[2]
 	
-	file1Column := "dialednum"
-	file2Column := "LINEA2"
+	file1Column := "new_ani"
+	file2Column := "LINEA1"
 	
 	fmt.Printf("Step 1: Loading unique phone numbers from '%s' into memory using column '%s'...\n", file1Path, file1Column)
 	phoneSet, err := readPhoneNumbersFromFile(file1Path, file1Column)
