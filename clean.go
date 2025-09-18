@@ -120,7 +120,9 @@ func writeCSV(processedRowsChan <-chan []string, wg *sync.WaitGroup) {
 
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {
-		log.Fatalf("Error creating output file: %v", err)
+		// Changed to Printf so the program doesn't exit.
+		log.Printf("Error creating output file: %v", err)
+		return
 	}
 	defer outputFile.Close()
 
@@ -129,7 +131,10 @@ func writeCSV(processedRowsChan <-chan []string, wg *sync.WaitGroup) {
 
 	for record := range processedRowsChan {
 		if err := writer.Write(record); err != nil {
-			log.Fatalf("Error writing record to output file: %v", err)
+			// Changed to Printf so the program doesn't exit.
+			log.Printf("Error writing record to output file: %v", err)
+			continue
 		}
 	}
+}
 }
