@@ -17,7 +17,7 @@ const (
 )
 
 // Define which columns you want to keep (0-indexed).
-var columnsToKeep = []int{0, 5, 10, 56, 54, 2, 12}
+var columnsToKeep = []int{0, 2, 12, 54,55,56,57,58}
 
 func main() {
 	// Use all available CPU cores for parallel processing.
