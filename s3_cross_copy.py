@@ -5,7 +5,7 @@ Source and destination are hardcoded below. Streams through this process—suita
 very large objects (e.g. 1TB). Preserves folder structure. No silent failures; progress
 printed frequently.
 
-Copies up to 16 files in parallel (capped to avoid OOM). Unattended: nohup python3 s3_cross_copy.py >> s3_cross_copy.log 2>&1 &
+Copies up to 16 files in parallel (capped to avoid OOM). For long runs use nohup so session disconnect doesn't kill the job: nohup python3 s3_cross_copy.py >> s3_cross_copy.log 2>&1 &
 """
 
 import argparse
@@ -21,7 +21,14 @@ from botocore.exceptions import ClientError
 from botocore.config import Config
 
 # --- Hardcoded source and destination (edit these) ---
-SOURCE_S3_URI = "s3://kindred-datawarehouse-samples/tgcf/MX/DB3/"
+# Multiple source paths; all are listed and copied under DEST_S3_URI preserving structure.
+# List entire DB3 and DB4 (includes all subfolders: DB4/maid, DB4/cookie, etc.)
+SOURCE_S3_URIS = [
+    "s3://kindred-datawarehouse-samples/tgcf/MX/DB3",
+    "s3://kindred-datawarehouse-samples/tgcf/MX/DB4",
+]
+# Prefix to strip from each source path to get dest subpath (e.g. tgcf/MX/ -> DB3, DB4/maid under MX2)
+SOURCE_BASE = "tgcf/MX/"
 SOURCE_PROFILE = "kindred"
 DEST_S3_URI = "s3://kindred-0/MX2/"
 DEST_PROFILE = "default"
@@ -86,10 +93,14 @@ def parse_s3_url(url):
 
 
 def list_all_objects(s3, bucket, prefix):
-    """List all object keys under prefix (paginated)."""
+    """List all object keys under prefix (paginated; fetches every page)."""
     keys = []
     paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+    for page in paginator.paginate(
+        Bucket=bucket,
+        Prefix=prefix,
+        PaginationConfig={"PageSize": 1000},
+    ):
         for obj in page.get("Contents") or []:
             keys.append(obj["Key"])
     return keys
@@ -134,6 +145,15 @@ def copy_one_object(
     start_time = time.time()
     prefix = f"  [{file_index}/{total_files}] " if file_index is not None else "  "
     log(f"{prefix}Copying s3://{source_bucket}/{source_key} -> s3://{dest_bucket}/{dest_key} ({total_size:,} bytes)")
+
+    # Empty objects: use put_object instead of multipart (multipart requires at least one part)
+    if total_size == 0:
+        try:
+            dest_s3.put_object(Bucket=dest_bucket, Key=dest_key, Body=b"")
+        except ClientError as e:
+            raise RuntimeError(f"put_object (empty) failed: {e}") from e
+        log(f"{prefix}  Done. Verified size 0 bytes (empty object).")
+        return
 
     # Initiate multipart upload
     try:
@@ -238,12 +258,13 @@ def main():
     if not args.no_update:
         update_script_from_s3()
 
-    source_bucket, source_prefix = parse_s3_url(SOURCE_S3_URI)
-    dest_bucket, dest_prefix = parse_s3_url(DEST_S3_URI)
-
-    if not source_bucket or not dest_bucket:
-        print("Invalid source or destination S3 URI (check hardcoded vars).", file=sys.stderr)
+    dest_bucket, dest_prefix_parsed = parse_s3_url(DEST_S3_URI)
+    if not dest_bucket:
+        print("Invalid destination S3 URI (check hardcoded vars).", file=sys.stderr)
         sys.exit(1)
+    dest_prefix = (dest_prefix_parsed or "").rstrip("/")
+    if dest_prefix:
+        dest_prefix = dest_prefix + "/"
 
     try:
         log_file = open(DEFAULT_LOG_FILE, "a", encoding="utf-8")
@@ -263,27 +284,71 @@ def main():
         source_s3 = source_session.client("s3", region_name=REGION, config=config)
         dest_s3 = dest_session.client("s3", region_name=REGION, config=config)
 
-        # Single object vs prefix
-        if source_prefix and not source_prefix.endswith("/"):
-            keys = [source_prefix]
-        else:
-            keys = list_all_objects(source_s3, source_bucket, source_prefix or "")
-            if not keys:
-                print("No objects found under source prefix.", file=sys.stderr)
-                sys.exit(1)
-            dest_prefix = (dest_prefix or "").rstrip("/")
-            if dest_prefix:
-                dest_prefix = dest_prefix + "/"
-
-        total = len(keys)
+        source_bucket = None
         tasks = []
-        for i, src_key in enumerate(keys, 1):
-            if total > 1:
-                rel = src_key[len(source_prefix or "") :].lstrip("/") if (source_prefix or "").rstrip("/") else src_key
-                dkey = (dest_prefix + rel) if dest_prefix else rel
+        source_summaries = []
+
+        for source_uri in SOURCE_S3_URIS:
+            bucket, prefix = parse_s3_url(source_uri)
+            if not bucket:
+                print(f"Invalid source URI: {source_uri}", file=sys.stderr)
+                sys.exit(1)
+            if source_bucket is None:
+                source_bucket = bucket
+            elif source_bucket != bucket:
+                print(f"All sources must use the same bucket (got {bucket} and {source_bucket}).", file=sys.stderr)
+                sys.exit(1)
+
+            # Use trailing slash so we list only objects under this path (all subfolders)
+            list_prefix = (prefix or "").rstrip("/")
+            if list_prefix:
+                list_prefix = list_prefix + "/"
+            keys = list_all_objects(source_s3, bucket, list_prefix)
+            pre = list_prefix.rstrip("/")  # base path for relative keys
+            if pre:
+                folders = sorted(set(k[len(pre):].lstrip("/").split("/")[0] for k in keys if len(k) > len(pre)))
             else:
-                dkey = dest_prefix if dest_prefix else src_key
-            tasks.append((src_key, dkey, i))
+                folders = sorted(set(k.split("/")[0] for k in keys))
+            source_summaries.append((source_uri, len(keys), folders))
+
+            dest_subpath = pre[len(SOURCE_BASE):].lstrip("/") if (SOURCE_BASE and pre.startswith(SOURCE_BASE)) else pre
+            if dest_subpath:
+                dest_subpath = dest_subpath.rstrip("/") + "/"
+
+            for src_key in keys:
+                rel = src_key[len(pre):].lstrip("/") if pre else src_key
+                dkey = (dest_prefix + dest_subpath + rel) if dest_subpath else (dest_prefix + rel) if dest_prefix else rel
+                tasks.append((src_key, dkey))
+
+        total = len(tasks)
+        if total == 0:
+            print("No objects found under any source prefix.", file=sys.stderr)
+            sys.exit(1)
+
+        # Before any copy: list all folders found in the source bucket
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        log_file.write(f"[{ts}] === Folders found in source bucket (before copy) ===\n")
+        log_file.flush()
+        print(f"[{ts}] === Folders found in source bucket (before copy) ===", flush=True)
+        for source_uri, count, folders in source_summaries:
+            folder_list = ", ".join(folders[:20]) + (" ..." if len(folders) > 20 else "")
+            line = f"  {source_uri}: {count} objects, folders: {folder_list}"
+            log_file.write(f"[{ts}] {line}\n")
+            log_file.flush()
+            print(f"  {source_uri}: {count} objects, folders: {folder_list}", flush=True)
+        total_line = f"  Total: {total} objects. Starting copy."
+        log_file.write(f"[{ts}] {total_line}\n")
+        log_file.flush()
+        print(f"[{ts}] {total_line}", flush=True)
+
+        reply = input("Proceed with copy? (y/n): ").strip().lower()
+        if reply not in ("y", "yes"):
+            print("Copy cancelled.", flush=True)
+            log_file.write(f"[{datetime.utcnow():%Y-%m-%d %H:%M:%S}] Copy cancelled by user.\n")
+            log_file.flush()
+            sys.exit(0)
+
+        tasks = [(src_key, dkey, i) for i, (src_key, dkey) in enumerate(tasks, 1)]
 
         workers = min(MAX_WORKERS, total)
         log_lock = threading.Lock() if workers > 1 else None
@@ -310,8 +375,29 @@ def main():
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(copy_task, item): item for item in tasks}
-                for future in as_completed(futures):
-                    future.result()
+                try:
+                    for future in as_completed(futures):
+                        future.result()
+                except KeyboardInterrupt:
+                    done = sum(1 for f in futures if f.done())
+                    if done == total:
+                        for f in futures:
+                            f.result()
+                        print("All objects copied and verified.", flush=True)
+                        sys.exit(0)
+                    else:
+                        log_file.write(
+                            f"[{datetime.utcnow():%Y-%m-%d %H:%M:%S}] Interrupted ({done}/{total} completed). "
+                            "Use nohup for long runs: nohup python3 s3_cross_copy.py >> s3_cross_copy.log 2>&1 &\n"
+                        )
+                        log_file.flush()
+                        print(f"Interrupted ({done}/{total} completed). Use nohup for long runs.", file=sys.stderr)
+                        sys.exit(1)
+    except KeyboardInterrupt:
+        log_file.write(f"[{datetime.utcnow():%Y-%m-%d %H:%M:%S}] Interrupted. Use nohup for long runs.\n")
+        log_file.flush()
+        print("Interrupted. Use nohup for long runs: nohup python3 s3_cross_copy.py >> s3_cross_copy.log 2>&1 &", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         log_file.write(f"[{datetime.utcnow():%Y-%m-%d %H:%M:%S}] ERROR: {e}\n")
         log_file.flush()
