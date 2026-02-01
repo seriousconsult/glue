@@ -22,6 +22,13 @@ aws ssm start-session --target <instance-id> --region us-east-2
 
 No SSH key. Uses Session Manager.
 
+**Optional: copy your AWS profiles to the EC2** (one command, no paste)
+
+In CloudShell, after the instance is running:  
+`python3 copy_aws_profiles.py`  
+(Or pass the instance ID: `python3 copy_aws_profiles.py i-xxxxx`.)  
+Profiles are pushed via S3 + SSM; the instance gets the same ~/.aws as CloudShell.
+
 **3. Upload files**
 
 Put your files in `/data` on the instance, then run:
@@ -45,6 +52,8 @@ python3 setup_server_to_s3.py --path /data
 | **create_transfer_ec2.py** | Creates the EC2. Run once from CloudShell. |
 | **setup_server_to_s3.py** or **.sh** | Downloads `server_to_s3.py` from S3, installs deps, runs it. Use on the EC2 when you don’t have the script there. |
 | **server_to_s3.py** | Does the upload (local folder → S3). Run it on the machine that has the files. |
+| **copy_aws_profiles.py** | Push AWS profiles from CloudShell to the EC2: run `python3 copy_aws_profiles.py` (no paste). |
+| **s3_cross_copy.py** | Copy S3 objects between buckets with different AWS profiles (streaming; for very large files). Preserves folder structure; progress + optional log file for unattended runs. |
 | **join.py** | S3 data join / streaming job. |
 | **un-parquet.py**, **uncompress.py** | Parquet and compression helpers. |
 
@@ -92,6 +101,38 @@ python3 setup_server_to_s3.py --path /data
 chmod +x setup_server_to_s3.sh
 ./setup_server_to_s3.sh --path /data
 ```
+
+---
+
+## s3_cross_copy.py — S3 to S3 with two profiles
+
+Copies objects from one bucket (one AWS profile) to another (another profile). Streams through the host so it works for very large objects (e.g. 1TB). Preserves folder structure under the destination prefix. No silent failures: each part is checked and final size is verified.
+
+**Single object:**
+```bash
+python3 s3_cross_copy.py \
+  --source s3://kindred-datawarehouse-samples/tgcf/MX/DB3/huge_file.parquet \
+  --source-profile kindred \
+  --dest s3://kindred-0/MX2/huge_file.parquet \
+  --dest-profile default
+```
+
+**Prefix (whole tree, preserve structure):**
+```bash
+python3 s3_cross_copy.py \
+  --source s3://kindred-datawarehouse-samples/tgcf/MX/DB3/ \
+  --source-profile kindred \
+  --dest s3://kindred-0/MX2/ \
+  --dest-profile default
+```
+
+**Unattended on transfer EC2 (run and disconnect):**
+```bash
+nohup python3 s3_cross_copy.py --source ... --dest ... --log-file s3_copy.log >> s3_copy.log 2>&1 &
+tail -f s3_copy.log
+```
+
+Use `--log-file` so progress is written to a file; combine with `nohup` and `tail -f` to monitor without staying logged in.
 
 ---
 
