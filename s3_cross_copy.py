@@ -5,12 +5,15 @@ Source and destination are hardcoded below. Streams through this process—suita
 very large objects (e.g. 1TB). Preserves folder structure. No silent failures; progress
 printed frequently.
 
-Unattended: nohup python3 s3_cross_copy.py --log-file s3_copy.log >> s3_copy.log 2>&1 &
+Copies up to 16 files in parallel (capped to avoid OOM). Unattended: nohup python3 s3_cross_copy.py >> s3_cross_copy.log 2>&1 &
 """
 
 import argparse
+import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import boto3
@@ -25,10 +28,52 @@ DEST_PROFILE = "default"
 REGION = "us-east-2"
 # ----------------------------------------------------
 
+# Script self-update: pull latest from this location before running
+SCRIPT_S3_BUCKET = "kindred-0"
+SCRIPT_S3_KEY = "data_engineering/s3_cross_copy.py"
+DEFAULT_LOG_FILE = "s3_cross_copy.log"
+
 # Multipart: S3 allows max 10,000 parts, min part 5MB (except last). For 1TB use 100MB parts.
 DEFAULT_PART_BYTES = 100 * 1024 * 1024  # 100 MB
+MAX_WORKERS = 16  # Parallel file copies; ~100–200 MB per worker—lower if OOM on small instances
 PROGRESS_INTERVAL_SEC = 2   # Print progress at least this often
 HEARTBEAT_SEC = 30          # If no part in this long, print "still copying..." so user knows it's not hung
+
+
+def update_script_from_s3():
+    """Download latest s3_cross_copy.py from S3, overwrite self, re-exec. Returns True if we re-exec'd (does not return)."""
+    try:
+        session = boto3.Session(profile_name=DEST_PROFILE)
+        s3 = session.client("s3", region_name=REGION)
+        resp = s3.get_object(Bucket=SCRIPT_S3_BUCKET, Key=SCRIPT_S3_KEY)
+        new_content = resp["Body"].read()
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+            return False
+        print(f"Could not fetch latest script from s3://{SCRIPT_S3_BUCKET}/{SCRIPT_S3_KEY}: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Could not fetch latest script: {e}", file=sys.stderr)
+        return False
+
+    try:
+        with open(__file__, "rb") as f:
+            current = f.read()
+        if new_content == current:
+            return False
+    except OSError:
+        return False
+
+    try:
+        with open(__file__, "wb") as f:
+            f.write(new_content)
+    except OSError as e:
+        print(f"Could not overwrite script (run from writable path?): {e}", file=sys.stderr)
+        return False
+
+    print("Updated script from s3://{}/{}; restarting.".format(SCRIPT_S3_BUCKET, SCRIPT_S3_KEY), flush=True)
+    os.execv(sys.executable, [sys.executable] + sys.argv + ["--no-update"])
+    return True  # unreachable
 
 
 def parse_s3_url(url):
@@ -59,6 +104,7 @@ def copy_one_object(
     dest_key,
     part_bytes,
     log_file,
+    log_lock=None,
     file_index=None,
     total_files=None,
 ):
@@ -77,7 +123,11 @@ def copy_one_object(
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}"
         print(line, flush=True)
-        if log_file:
+        if log_lock:
+            with log_lock:
+                log_file.write(line + "\n")
+                log_file.flush()
+        else:
             log_file.write(line + "\n")
             log_file.flush()
 
@@ -174,123 +224,101 @@ def copy_one_object(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Copy S3 objects between buckets using different AWS profiles (streaming; safe for very large files).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument(
-        "--source",
-        required=True,
-        help="Source S3 URI, e.g. s3://bucket/key or s3://bucket/prefix/",
-    )
-    parser.add_argument(
-        "--source-profile",
-        required=True,
-        dest="source_profile",
-        help="AWS profile for source bucket",
-    )
-    parser.add_argument(
-        "--dest",
-        required=True,
-        help="Destination S3 URI, e.g. s3://bucket/key or s3://bucket/prefix/",
-    )
-    parser.add_argument(
-        "--dest-profile",
-        required=True,
-        dest="dest_profile",
-        help="AWS profile for destination bucket",
+        description="Copy S3 objects (source/dest hardcoded). Copies many files in parallel.",
     )
     parser.add_argument(
         "--part-size",
         type=int,
         default=DEFAULT_PART_BYTES,
-        help=f"Part size in bytes for multipart upload (default {DEFAULT_PART_BYTES // (1024*1024)} MB)",
+        help=f"Part size in bytes (default {DEFAULT_PART_BYTES // (1024*1024)} MB)",
     )
-    parser.add_argument(
-        "--region",
-        default="us-east-2",
-        help="AWS region for both clients (default us-east-2)",
-    )
-    parser.add_argument(
-        "--log-file",
-        dest="log_file",
-        metavar="PATH",
-        help="Also append all progress to this file (for unattended runs)",
-    )
+    parser.add_argument("--no-update", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    source_bucket, source_prefix = parse_s3_url(args.source)
-    dest_bucket, dest_prefix = parse_s3_url(args.dest)
+    if not args.no_update:
+        update_script_from_s3()
+
+    source_bucket, source_prefix = parse_s3_url(SOURCE_S3_URI)
+    dest_bucket, dest_prefix = parse_s3_url(DEST_S3_URI)
 
     if not source_bucket or not dest_bucket:
-        print("Invalid source or destination S3 URI.", file=sys.stderr)
+        print("Invalid source or destination S3 URI (check hardcoded vars).", file=sys.stderr)
         sys.exit(1)
 
-    log_file = None
-    if args.log_file:
-        try:
-            log_file = open(args.log_file, "a", encoding="utf-8")
-        except OSError as e:
-            print(f"Cannot open log file: {e}", file=sys.stderr)
-            sys.exit(1)
+    try:
+        log_file = open(DEFAULT_LOG_FILE, "a", encoding="utf-8")
+    except OSError as e:
+        print(f"Cannot open log file {DEFAULT_LOG_FILE}: {e}", file=sys.stderr)
+        sys.exit(1)
 
     try:
         config = Config(
-            read_timeout=300,
+            read_timeout=600,
             connect_timeout=60,
             retries={"max_attempts": 5, "mode": "standard"},
+            max_pool_connections=64,
         )
-        source_session = boto3.Session(profile_name=args.source_profile)
-        dest_session = boto3.Session(profile_name=args.dest_profile)
-        source_s3 = source_session.client("s3", region_name=args.region, config=config)
-        dest_s3 = dest_session.client("s3", region_name=args.region, config=config)
+        source_session = boto3.Session(profile_name=SOURCE_PROFILE)
+        dest_session = boto3.Session(profile_name=DEST_PROFILE)
+        source_s3 = source_session.client("s3", region_name=REGION, config=config)
+        dest_s3 = dest_session.client("s3", region_name=REGION, config=config)
 
         # Single object vs prefix
         if source_prefix and not source_prefix.endswith("/"):
-            # Single object
             keys = [source_prefix]
-            dest_prefix_for_key = dest_prefix  # dest_key = dest_prefix (might include filename)
         else:
-            # List all under prefix
             keys = list_all_objects(source_s3, source_bucket, source_prefix or "")
             if not keys:
                 print("No objects found under source prefix.", file=sys.stderr)
                 sys.exit(1)
-            # Preserve structure: dest_key = dest_prefix + relative_path
             dest_prefix = (dest_prefix or "").rstrip("/")
             if dest_prefix:
                 dest_prefix = dest_prefix + "/"
 
         total = len(keys)
+        tasks = []
         for i, src_key in enumerate(keys, 1):
             if total > 1:
-                # Preserve path under source prefix
                 rel = src_key[len(source_prefix or "") :].lstrip("/") if (source_prefix or "").rstrip("/") else src_key
-                dest_key = (dest_prefix + rel) if dest_prefix else rel
+                dkey = (dest_prefix + rel) if dest_prefix else rel
             else:
-                dest_key = dest_prefix if dest_prefix else src_key
+                dkey = dest_prefix if dest_prefix else src_key
+            tasks.append((src_key, dkey, i))
 
-            copy_one_object(
+        workers = min(MAX_WORKERS, total)
+        log_lock = threading.Lock() if workers > 1 else None
+
+        def copy_task(item):
+            src_key, dkey, i = item
+            return copy_one_object(
                 source_s3,
                 source_bucket,
                 src_key,
                 dest_s3,
                 dest_bucket,
-                dest_key,
+                dkey,
                 args.part_size,
                 log_file,
+                log_lock=log_lock,
                 file_index=i,
                 total_files=total,
             )
+
+        if workers == 1:
+            for item in tasks:
+                copy_task(item)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(copy_task, item): item for item in tasks}
+                for future in as_completed(futures):
+                    future.result()
     except Exception as e:
-        if log_file:
-            log_file.write(f"[{datetime.utcnow():%Y-%m-%d %H:%M:%S}] ERROR: {e}\n")
-            log_file.flush()
+        log_file.write(f"[{datetime.utcnow():%Y-%m-%d %H:%M:%S}] ERROR: {e}\n")
+        log_file.flush()
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
-        if log_file:
-            log_file.close()
+        log_file.close()
 
     print("All objects copied and verified.", flush=True)
 

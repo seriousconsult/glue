@@ -106,33 +106,18 @@ chmod +x setup_server_to_s3.sh
 
 ## s3_cross_copy.py — S3 to S3 with two profiles
 
-Copies objects from one bucket (one AWS profile) to another (another profile). Streams through the host so it works for very large objects (e.g. 1TB). Preserves folder structure under the destination prefix. No silent failures: each part is checked and final size is verified.
+Copies objects from one bucket (one AWS profile) to another (another profile). Source and destination are hardcoded in the script. Streams through the host so it works for very large objects (e.g. 1TB). Preserves folder structure. No silent failures; progress is always written to `s3_cross_copy.log`.
 
-**Single object:**
+**Run:**
 ```bash
-python3 s3_cross_copy.py \
-  --source s3://kindred-datawarehouse-samples/tgcf/MX/DB3/huge_file.parquet \
-  --source-profile kindred \
-  --dest s3://kindred-0/MX2/huge_file.parquet \
-  --dest-profile default
-```
-
-**Prefix (whole tree, preserve structure):**
-```bash
-python3 s3_cross_copy.py \
-  --source s3://kindred-datawarehouse-samples/tgcf/MX/DB3/ \
-  --source-profile kindred \
-  --dest s3://kindred-0/MX2/ \
-  --dest-profile default
+python3 s3_cross_copy.py
 ```
 
 **Unattended on transfer EC2 (run and disconnect):**
 ```bash
-nohup python3 s3_cross_copy.py --source ... --dest ... --log-file s3_copy.log >> s3_copy.log 2>&1 &
-tail -f s3_copy.log
+nohup python3 s3_cross_copy.py >> s3_cross_copy.log 2>&1 &
+tail -f s3_cross_copy.log
 ```
-
-Use `--log-file` so progress is written to a file; combine with `nohup` and `tail -f` to monitor without staying logged in.
 
 ---
 
