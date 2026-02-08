@@ -5,7 +5,8 @@ Source and destination are hardcoded below. Streams through this process—suita
 very large objects (e.g. 1TB). Preserves folder structure. No silent failures; progress
 printed frequently.
 
-Copies up to 16 files in parallel (capped to avoid OOM). For long runs use nohup so session disconnect doesn't kill the job: nohup python3 s3_cross_copy.py >> s3_cross_copy.log 2>&1 &
+Copies up to 16 files in parallel (capped to avoid OOM). For long runs use nohup so session 
+disconnect doesn't kill the job: nohup python3 s3_cross_copy.py >> s3_cross_copy.log 2>&1 &
 """
 
 import argparse
@@ -23,10 +24,8 @@ from botocore.config import Config
 # --- Hardcoded source and destination (edit these) ---
 # Multiple source paths; all are listed and copied under DEST_S3_URI preserving structure.
 # List entire DB3 and DB4 (includes all subfolders: DB4/maid, DB4/cookie, etc.)
-SOURCE_S3_URIS = [
-    "s3://kindred-datawarehouse-samples/tgcf/MX/DB3",
-    "s3://kindred-datawarehouse-samples/tgcf/MX/DB4",
-]
+SOURCE_S3_URIS = ["s3://kindred-datawarehouse-samples/tgcf/MX/"]
+
 # Prefix to strip from each source path to get dest subpath (e.g. tgcf/MX/ -> DB3, DB4/maid under MX2)
 SOURCE_BASE = "tgcf/MX/"
 SOURCE_PROFILE = "kindred"
@@ -48,7 +47,7 @@ HEARTBEAT_SEC = 30          # If no part in this long, print "still copying..." 
 
 
 def update_script_from_s3():
-    """Download latest s3_cross_copy.py from S3, overwrite self, re-exec. Returns True if we re-exec'd (does not return)."""
+    """Download latest s3_cross_copy.py from S3, overwrite self, re-exec. When fetch succeeds, always overwrite and restart so we run the S3 version."""
     try:
         session = boto3.Session(profile_name=DEST_PROFILE)
         s3 = session.client("s3", region_name=REGION)
@@ -56,28 +55,22 @@ def update_script_from_s3():
         new_content = resp["Body"].read()
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
-            return False
-        print(f"Could not fetch latest script from s3://{SCRIPT_S3_BUCKET}/{SCRIPT_S3_KEY}: {e}", file=sys.stderr)
-        return False
+            print("Script not found in S3; cannot run.", file=sys.stderr)
+        else:
+            print(f"Could not fetch latest script from s3://{SCRIPT_S3_BUCKET}/{SCRIPT_S3_KEY}: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"Could not fetch latest script: {e}", file=sys.stderr)
-        return False
-
-    try:
-        with open(__file__, "rb") as f:
-            current = f.read()
-        if new_content == current:
-            return False
-    except OSError:
-        return False
+        sys.exit(1)
 
     try:
         with open(__file__, "wb") as f:
             f.write(new_content)
     except OSError as e:
         print(f"Could not overwrite script (run from writable path?): {e}", file=sys.stderr)
-        return False
+        sys.exit(1)
 
+    # Always restart so we run the script we just wrote (the S3 version)
     print("Updated script from s3://{}/{}; restarting.".format(SCRIPT_S3_BUCKET, SCRIPT_S3_KEY), flush=True)
     os.execv(sys.executable, [sys.executable] + sys.argv + ["--no-update"])
     return True  # unreachable
@@ -305,13 +298,21 @@ def main():
                 list_prefix = list_prefix + "/"
             keys = list_all_objects(source_s3, bucket, list_prefix)
             pre = list_prefix.rstrip("/")  # base path for relative keys
-            if pre:
-                folders = sorted(set(k[len(pre):].lstrip("/").split("/")[0] for k in keys if len(k) > len(pre)))
-            else:
-                folders = sorted(set(k.split("/")[0] for k in keys))
+            # Collect every unique nested folder path (path without filename)
+            folder_set = set()
+            for k in keys:
+                rel = k[len(pre):].lstrip("/") if pre else k
+                if "/" in rel:
+                    folder_set.add(rel.rsplit("/", 1)[0])  # dir part only
+            folders = sorted(f for f in folder_set if f)  # drop empty
             source_summaries.append((source_uri, len(keys), folders))
 
-            dest_subpath = pre[len(SOURCE_BASE):].lstrip("/") if (SOURCE_BASE and pre.startswith(SOURCE_BASE)) else pre
+            # Strip SOURCE_BASE so dest is MX2/DB3/... not MX2/tgcf/MX/DB3/...
+            source_base = (SOURCE_BASE or "").rstrip("/")
+            if source_base and (pre == source_base or pre.startswith(source_base + "/")):
+                dest_subpath = pre[len(source_base):].lstrip("/")
+            else:
+                dest_subpath = pre
             if dest_subpath:
                 dest_subpath = dest_subpath.rstrip("/") + "/"
 
@@ -331,11 +332,21 @@ def main():
         log_file.flush()
         print(f"[{ts}] === Folders found in source bucket (before copy) ===", flush=True)
         for source_uri, count, folders in source_summaries:
-            folder_list = ", ".join(folders[:20]) + (" ..." if len(folders) > 20 else "")
-            line = f"  {source_uri}: {count} objects, folders: {folder_list}"
+            line = f"  {source_uri}: {count} objects, {len(folders)} nested folder(s):"
             log_file.write(f"[{ts}] {line}\n")
             log_file.flush()
-            print(f"  {source_uri}: {count} objects, folders: {folder_list}", flush=True)
+            print(f"  {source_uri}: {count} objects, {len(folders)} nested folder(s):", flush=True)
+            # Print each folder on its own line so DB4/maid, DB4/cookie, etc. are all visible
+            for f in folders[:200]:  # cap at 200 lines
+                sub = f"    {f}"
+                log_file.write(f"[{ts}] {sub}\n")
+                log_file.flush()
+                print(sub, flush=True)
+            if len(folders) > 200:
+                etc = f"    ... and {len(folders) - 200} more"
+                log_file.write(f"[{ts}] {etc}\n")
+                log_file.flush()
+                print(etc, flush=True)
         total_line = f"  Total: {total} objects. Starting copy."
         log_file.write(f"[{ts}] {total_line}\n")
         log_file.flush()
