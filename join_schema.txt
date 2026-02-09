@@ -1,0 +1,15 @@
++----------------------+----------------------+--------------------------------------------------+
+| ID Name              | Found In Table(s)    | Primary Use / Join Potential                     |
++----------------------+----------------------+--------------------------------------------------+
+| ifa (Ad ID)          | DB3, DB4 (_tmp_maid) | Targetable user identity (iOS/Android).          |
+| ani (Phone Number)   | Granite              | The caller's mobile number.                      |
+| ip_address           | Granite, DB3         | One is private and one is public, so no match.   |
+| Lat / Lon (GPS)      | DB3, DB4             | Maybe BRIDGE. Link device info to movement speed.|
+| bundle_id            | DB3                  | App ID (e.g., com.facebook.orca).                |
+| callid / cdr_seq_no  | Granite              | Unique transaction ID for a specific call.       |
+| ASN                  | DB3                  | ISP/Network identification (e.g., Comcast).      |
+| LRN / OCN            | Granite, DB3         | Carrier routing; detects if a number was ported  |
+| msw_name             | Granite              | Identifies the specific network hardware switch  |
+| codec_on_src_leg     | Granite              | Audio quality; acts as a hardware "signature".   |
+| id5 / ttdid          | DB4 (ID5/TTD folders)| Vendor-specific Universal IDs for ad-tracking.   |
++----------------------+----------------------+--------------------------------------------------+
